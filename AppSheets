@@ -1,0 +1,121 @@
+/**
+ * SQUAD AIOS V2 - Axiomtec
+ * Arquiteto Financeiro: Motor V2.4 (Nova Chave + Gemini 3.6 Flash + Blindagem)
+ * Regra: Campos Cliente e Fornecedor Separados | Custo Zero
+ */
+
+// Sua NOVA Chave API inserida
+const GEMINI_API_KEY = "AQ.Ab8RN6KL5ai-LE6DTW2QZ0jtNn_HczBhDwk_SGbG0573iL9kog"; 
+const PLANILHA_ID = "1XvUF4dU_hZNYftFiNxL4pBsvRxRIClUfN1C2Kb2MftQ"; 
+const NOME_ABA = "Simulador_Bling_MVP";
+
+function processarNovasDespesas() {
+  const sheet = SpreadsheetApp.openById(PLANILHA_ID).getSheetByName(NOME_ABA);
+  if (!sheet) return;
+
+  const data = sheet.getDataRange().getValues();
+  const headers = data[0];
+
+  const idxStatus = headers.indexOf("Status_Simulador");
+  const idxImagem = headers.indexOf("Link_Comprovante");
+  const idxFornecedor = headers.indexOf("Fornecedor"); 
+  const idxValor = headers.indexOf("Valor_Total");
+
+  for (let i = data.length - 1; i > 0; i--) {
+    let row = data[i];
+    let status = row[idxStatus] ? row[idxStatus].toString() : "";
+    let imagemCaminho = row[idxImagem];
+
+    if ((status === "Pendente" || status.includes("❌")) && imagemCaminho) {
+      
+      const nomeArquivo = imagemCaminho.split('/').pop();
+      const arquivosDrive = DriveApp.getFilesByName(nomeArquivo);
+
+      if (arquivosDrive.hasNext()) {
+        const arquivo = arquivosDrive.next();
+        const blob = arquivo.getBlob();
+        const base64Image = Utilities.base64Encode(blob.getBytes());
+        
+        sheet.getRange(i + 1, idxStatus + 1).setValue("⏳ Processando IA (Pode levar 15s)...");
+        SpreadsheetApp.flush(); 
+        
+        const dadosExtraidos = chamarGemini(base64Image);
+
+        if (dadosExtraidos && !dadosExtraidos.erro) {
+          if (!row[idxFornecedor]) sheet.getRange(i + 1, idxFornecedor + 1).setValue(dadosExtraidos.Fornecedor);
+          
+          if (!row[idxValor]) {
+            const valorNumerico = parseFloat(dadosExtraidos.Valor_Total.toString().replace(',', '.'));
+            sheet.getRange(i + 1, idxValor + 1).setValue(valorNumerico);
+          }
+          sheet.getRange(i + 1, idxStatus + 1).setValue("✅ Validado IA");
+        } else {
+          sheet.getRange(i + 1, idxStatus + 1).setValue("❌ " + (dadosExtraidos ? dadosExtraidos.erro : "Erro Desconhecido"));
+        }
+      } else {
+         sheet.getRange(i + 1, idxStatus + 1).setValue("❌ Imagem não encontrada no Drive");
+      }
+    }
+  }
+}
+
+function chamarGemini(base64Image) {
+  const prompt = `Você é o Arquiteto Financeiro da Axiomtec. Faça o OCR deste recibo/comprovante.
+  Retorne EXCLUSIVAMENTE um objeto JSON válido, sem nenhuma marcação, crase ou texto adicional. 
+  Use rigorosamente estas duas chaves:
+  {
+    "Fornecedor": "Nome do Estabelecimento",
+    "Valor_Total": 0.00
+  }`;
+
+  const payload = {
+    contents: [{
+      parts: [
+        { text: prompt },
+        { inlineData: { mimeType: "image/jpeg", data: base64Image } }
+      ]
+    }]
+  };
+
+  // Voltamos para a linha Flash (gratuita) na versão 3.6
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${GEMINI_API_KEY}`;
+  
+  const maxTentativas = 3;
+  
+  for (let tentativa = 1; tentativa <= maxTentativas; tentativa++) {
+    try {
+      const res = UrlFetchApp.fetch(url, {
+        method: "post",
+        contentType: "application/json",
+        payload: JSON.stringify(payload),
+        muteHttpExceptions: true
+      });
+
+      const jsonRes = JSON.parse(res.getContentText());
+      
+      if (jsonRes.error) {
+        // Se bater no engarrafamento (high demand), espera e tenta de novo
+        if (jsonRes.error.message.toLowerCase().includes("high demand") && tentativa < maxTentativas) {
+          Utilities.sleep(5000 * tentativa);
+          continue; 
+        }
+        return { erro: jsonRes.error.message }; 
+      }
+
+      let geminiText = jsonRes.candidates[0].content.parts[0].text;
+      const start = geminiText.indexOf("{");
+      const end = geminiText.lastIndexOf("}") + 1;
+      
+      if (start === -1) return { erro: "O modelo não retornou um JSON identificável." };
+      
+      geminiText = geminiText.slice(start, end);
+      return JSON.parse(geminiText);
+      
+    } catch (error) {
+      if (tentativa === maxTentativas) {
+        return { erro: "Falha após 3 tentativas de conexão: " + error.toString() };
+      }
+      Utilities.sleep(5000 * tentativa);
+    }
+  }
+}

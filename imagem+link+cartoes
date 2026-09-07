@@ -1,0 +1,302 @@
+/**
+ * AXIOMTEC - SQUAD AIOS V2
+ * Versão: Síncrona, retorno direto ao webhook, retry Gemini, link Drive
+ */
+
+const GEMINI_API_KEY  = "AIzaSyDQESSGZAs5d-UKwXxw0GlpMm-PKYpJYvo"; // sua chave atual
+const GEMINI_MODEL    = "gemini-3.6-flash";
+const ID_PLANILHA_MVP = "1XvUF4dU_hZNYftFiNxL4pBsvRxRIClUfN1C2Kb2MftQ";
+const NOME_ABA        = "Simulador_Bling_MVP";
+const ID_PASTA_DRIVE  = "1QGOeUOPMX_Unoc3Fj3mYwnku6InTCKFr";
+
+function doPost(e) {
+  try {
+    if (!e || !e.postData || !e.postData.contents) {
+      return respostaJSON({ text: "Servidor online, aguardando dados." });
+    }
+
+    var event = JSON.parse(e.postData.contents);
+
+    if (event.type === "CARD_CLICKED") {
+      return processarCliqueBotao(event);
+    }
+
+    if (event.type === "MESSAGE") {
+      var textoMensagem = event.message.text ? event.message.text.trim() : "";
+      var temAnexo = event.message.attachment && event.message.attachment.length > 0;
+
+      if (temAnexo) {
+        return processarRecibo(event, textoMensagem);
+      }
+
+      if (textoMensagem.toLowerCase().indexOf("orcamento") !== -1 ||
+          textoMensagem.toLowerCase().indexOf("orçamento") !== -1) {
+        return calcularOrcamento(textoMensagem);
+      }
+
+      return respostaJSON({
+        text: "AIOS V2 Online\n\nEnvie a foto do comprovante com a legenda informando o cliente ou obra.\nDigite 'orcamento [valor]' para calcular margem."
+      });
+    }
+
+    return respostaJSON({ text: "Conexao estabelecida." });
+
+  } catch (error) {
+    return respostaJSON({ text: "Erro Fatal: " + error.message });
+  }
+}
+
+function respostaJSON(objeto) {
+  return ContentService
+    .createTextOutput(JSON.stringify(objeto))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function processarRecibo(event, legendaMensagem) {
+  var anexo        = event.message.attachment[0];
+  var attachmentId = anexo.attachmentDataRef.resourceName;
+
+  try {
+    // Download da imagem
+    var urlChat = "https://chat.googleapis.com/v1/media/" + attachmentId + "?alt=media";
+    var responseMedia = UrlFetchApp.fetch(urlChat, {
+      method: "get",
+      headers: { "Authorization": "Bearer " + ScriptApp.getOAuthToken() },
+      muteHttpExceptions: true
+    });
+
+    if (responseMedia.getResponseCode() !== 200) {
+      return respostaJSON({ text: "Falha ao baixar imagem do Chat. Codigo: " + responseMedia.getResponseCode() });
+    }
+
+    // Salva imagem na pasta do Drive
+    var nomeArquivo = "Comprovante_" + Utilities.formatDate(new Date(), "GMT-3", "yyyyMMdd_HHmmss") + ".jpg";
+    var pasta       = DriveApp.getFolderById(ID_PASTA_DRIVE);
+    var arquivo     = pasta.createFile(responseMedia.getBlob().setName(nomeArquivo));
+    arquivo.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    var linkComprovante = arquivo.getUrl();
+
+    var base64Image = Utilities.base64Encode(responseMedia.getBlob().getBytes());
+
+    var urlGemini = "https://generativelanguage.googleapis.com/v1beta/models/" +
+                    GEMINI_MODEL + ":generateContent?key=" + GEMINI_API_KEY;
+
+    var prompt = "Analise este comprovante de pagamento e extraia as informacoes." +
+      " Retorne APENAS um objeto JSON valido, sem markdown, sem explicacao:" +
+      ' {"data": "DD/MM/YYYY", "fornecedor": "nome do estabelecimento", "valor": 0.00, "forma_pagamento": "Cartao, Pix, Boleto, Dinheiro, etc."}' +
+      " Se algum campo nao estiver visivel, use string vazia ou 0.";
+
+    var payload = {
+      contents: [{
+        parts: [
+          { text: prompt },
+          { inline_data: { mime_type: "image/jpeg", data: base64Image } }
+        ]
+      }]
+    };
+
+    // Chamada ao Gemini com retry automático
+    var responseIA;
+    var tentativas    = 0;
+    var maxTentativas = 3;
+
+    while (tentativas < maxTentativas) {
+      tentativas++;
+      responseIA = UrlFetchApp.fetch(urlGemini, {
+        method: "post",
+        contentType: "application/json",
+        payload: JSON.stringify(payload),
+        muteHttpExceptions: true
+      });
+
+      if (responseIA.getResponseCode() === 200) break;
+
+      var codigoErro = JSON.parse(responseIA.getContentText()).error.code;
+      if (codigoErro === 503 && tentativas < maxTentativas) {
+        Utilities.sleep(3000);
+      } else {
+        return respostaJSON({
+          text: "Erro na API Gemini (tentativa " + tentativas + "): " + responseIA.getContentText()
+        });
+      }
+    }
+
+    var dadosIA    = JSON.parse(responseIA.getContentText());
+    var textoLimpo = dadosIA.candidates[0].content.parts[0].text.replace(/```json|```/gi, "").trim();
+    var extraido   = JSON.parse(textoLimpo);
+
+    extraido.centro_de_custo  = legendaMensagem || "";
+    extraido.link_comprovante = linkComprovante;
+
+    return respostaJSON(criarCardAprovacao(extraido));
+
+  } catch (err) {
+    return respostaJSON({ text: "Falha no processamento: " + err.message });
+  }
+}
+
+function criarCardAprovacao(dados) {
+  var opcoesForma = [
+    "Cartão BTG PJ",
+    "Cartão C6 Carbon Mastercard",
+    "Cartão Cora",
+    "Cartão Itaú Azul",
+    "Nubank PJ",
+    "Pix",
+    "Dinheiro"
+  ];
+
+  var itensForma = opcoesForma.map(function(opcao) {
+    return {
+      text: opcao,
+      value: opcao,
+      selected: dados.forma_pagamento &&
+                dados.forma_pagamento.toLowerCase().indexOf(opcao.toLowerCase()) !== -1
+    };
+  });
+
+  return {
+    text: "Comprovante lido. Revise os dados e confirme.",
+    cardsV2: [{
+      cardId: "card_recibo",
+      card: {
+        header: {
+          title: "Despesa de Campo",
+          subtitle: "Edite os campos e injete no MVP"
+        },
+        sections: [{
+          widgets: [
+            {
+              textInput: {
+                name: "fornecedor",
+                label: "Fornecedor",
+                type: "SINGLE_LINE",
+                value: dados.fornecedor || ""
+              }
+            },
+            {
+              textInput: {
+                name: "valor",
+                label: "Valor (R$)",
+                type: "SINGLE_LINE",
+                value: String(dados.valor || "")
+              }
+            },
+            {
+              textInput: {
+                name: "data",
+                label: "Data (DD/MM/YYYY)",
+                type: "SINGLE_LINE",
+                value: dados.data || ""
+              }
+            },
+            {
+              textInput: {
+                name: "centro_de_custo",
+                label: "Cliente / Obra / Centro de Custo",
+                type: "SINGLE_LINE",
+                hintText: "Ex: Cliente Tanae, Obra Alphaville, G4 Treinamento",
+                value: dados.centro_de_custo || ""
+              }
+            },
+            {
+              selectionInput: {
+                name: "forma_pagamento",
+                label: "Forma de Pagamento",
+                type: "DROPDOWN",
+                items: itensForma
+              }
+            },
+            {
+              textInput: {
+                name: "link_comprovante",
+                label: "Link do Comprovante (Drive)",
+                type: "SINGLE_LINE",
+                value: dados.link_comprovante || "URL_Pendente"
+              }
+            },
+            {
+              buttonList: {
+                buttons: [{
+                  text: "INJETAR NO MVP",
+                  onClick: {
+                    action: { function: "salvarMVP" }
+                  }
+                }]
+              }
+            }
+          ]
+        }]
+      }
+    }]
+  };
+}
+
+function processarCliqueBotao(event) {
+  if (event.action.actionMethodName === "salvarMVP") {
+    try {
+      var form = event.common.formInputs;
+
+      var fornecedor      = (form.fornecedor && form.fornecedor.stringInputs.value[0])               || "N/A";
+      var valorStr        = (form.valor && form.valor.stringInputs.value[0])                          || "0";
+      var valor           = parseFloat(valorStr.replace(",", ".")) || 0;
+      var data            = (form.data && form.data.stringInputs.value[0])                            || "N/A";
+      var centroCusto     = (form.centro_de_custo && form.centro_de_custo.stringInputs.value[0])     || "A Classificar";
+      var formaPgto       = (form.forma_pagamento && form.forma_pagamento.stringInputs.value[0])     || "Nao informado";
+      var linkComprovante = (form.link_comprovante && form.link_comprovante.stringInputs.value[0])   || "URL_Pendente";
+
+      var sheet = SpreadsheetApp.openById(ID_PLANILHA_MVP).getSheetByName(NOME_ABA);
+      if (!sheet) throw new Error("Aba " + NOME_ABA + " nao encontrada.");
+
+      sheet.appendRow([
+        Utilities.getUuid(),
+        data,
+        "Contas a Pagar",
+        fornecedor,
+        valor,
+        formaPgto,
+        centroCusto,
+        "Despesa Chat - " + fornecedor,
+        linkComprovante,
+        "Pendente"
+      ]);
+
+      return respostaJSON({
+        actionResponse: { type: "UPDATE_MESSAGE" },
+        cardsV2: [{
+          cardId: "ok",
+          card: {
+            header: {
+              title: "Salvo no Simulador MVP",
+              subtitle: fornecedor + " | R$ " + valor.toFixed(2) + " | " + centroCusto
+            }
+          }
+        }]
+      });
+
+    } catch (err) {
+      return respostaJSON({ text: "Erro ao salvar na planilha: " + err.message });
+    }
+  }
+}
+
+function calcularOrcamento(texto) {
+  var numeros = texto.match(/\d+(?:[.,]\d+)?/g);
+  if (!numeros) {
+    return respostaJSON({ text: "Informe o custo real. Ex: orcamento 500" });
+  }
+
+  var custoReal  = parseFloat(numeros[0].replace(",", "."));
+  var margem     = 0.40;
+  var imposto    = 0.00;
+  var precoFinal = custoReal / (1 - imposto - margem);
+  var lucro      = precoFinal - custoReal;
+
+  return respostaJSON({
+    text: "Orcamento Estruturado\n\n" +
+          "Custo Base: R$ " + custoReal.toFixed(2) + "\n" +
+          "Margem Liquida: 40%\n" +
+          "Lucro Projetado: R$ " + lucro.toFixed(2) + "\n" +
+          "Preco de Venda Final: R$ " + precoFinal.toFixed(2)
+  });
+}
